@@ -4,6 +4,7 @@
 #include "aurora/gfx.h"
 #include "../gfx/recording.hpp"
 #include "../gfx/presentation.hpp"
+#include "../gfx/motion_gate.hpp"
 
 // Guest matrices really do carry NaN/Inf, and the isfinite guards here keep them
 // out of the MatchEdge sort. Needs -fno-finite-math-only (see runtime/CMakeLists.txt).
@@ -428,6 +429,11 @@ struct PreparedAffinePair {
   std::array<float, 3> currentTranslation{};
   Quaternion previousQuaternion{};
   Quaternion currentQuaternion{};
+  // |dot| of the two rotations, for the prediction gate.
+  float quaternionDot = 1.0f;
+  // Linear (palette) pairs: determinants of the 3x3 parts.
+  float previousDeterminant = 1.0f;
+  float currentDeterminant = 1.0f;
   bool linear = false;
   bool identical = false;
   bool valid = false;
@@ -488,8 +494,21 @@ PreparedAffinePair prepare_affine_pair(const Mat3x4<float>& previous,
   if (!std::isfinite(quaternionDot) || quaternionDot < kMinimumQuaternionDot) {
     return pair;
   }
+  // A mirrored camera (looking back) flips a scale sign; blending through it squashes the image.
+  for (size_t axis = 0; axis < 3; ++axis) {
+    if (!gfx::scale_blendable(pair.previousScale[axis], pair.currentScale[axis], 0.5f)) {
+      return pair;
+    }
+  }
+  pair.quaternionDot = quaternionDot;
   pair.valid = true;
   return pair;
+}
+
+float determinant3(const Mat3x4<float>& m) noexcept {
+  return m.m0.x() * (m.m1.y() * m.m2.z() - m.m1.z() * m.m2.y()) -
+         m.m0.y() * (m.m1.x() * m.m2.z() - m.m1.z() * m.m2.x()) +
+         m.m0.z() * (m.m1.x() * m.m2.y() - m.m1.y() * m.m2.x());
 }
 
 // Indexed matrices are final palette transforms, so interpolate coefficients instead
@@ -526,8 +545,32 @@ PreparedAffinePair prepare_indexed_pair(const Mat3x4<float>& previous,
         kMaximumTranslationPerFrame * kMaximumTranslationPerFrame)) {
     return pair;
   }
+  pair.previousDeterminant = determinant3(previous);
+  pair.currentDeterminant = determinant3(current);
+  if (!gfx::scale_blendable(pair.previousDeterminant, pair.currentDeterminant, 0.5f)) {
+    return pair;
+  }
   pair.valid = true;
   return pair;
+}
+
+// Prediction (weight above 1) only follows steady motion; otherwise the current frame is shown.
+bool predictable(const PreparedAffinePair& pair, float weight) noexcept {
+  if (weight <= 1.0f) {
+    return true;
+  }
+  if (pair.linear) {
+    return gfx::scale_blendable(pair.previousDeterminant, pair.currentDeterminant, weight);
+  }
+  if (!gfx::rotation_blendable(pair.quaternionDot, weight)) {
+    return false;
+  }
+  for (size_t axis = 0; axis < 3; ++axis) {
+    if (!gfx::scale_blendable(pair.previousScale[axis], pair.currentScale[axis], weight)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool evaluate_affine_pair(const PreparedAffinePair& pair, float weight,
@@ -535,6 +578,10 @@ bool evaluate_affine_pair(const PreparedAffinePair& pair, float weight,
   if (!pair.valid || pair.identical) {
     output = pair.current;
     return pair.valid;
+  }
+  if (!predictable(pair, weight)) {
+    output = pair.current;
+    return true;
   }
 
   if (pair.linear) {
@@ -610,6 +657,12 @@ bool interpolate_affine_impl(const Mat3x4<float>& previous, const Mat3x4<float>&
 Mat4x4<float> interpolate_projection(const Mat4x4<float>& previous, const Mat4x4<float>& current,
                                      float weight) noexcept {
   Mat4x4<float> result = current;
+  // The look-back camera mirrors the projection; never blend or predict across that, and only
+  // predict steady zooms.
+  if (!gfx::scale_blendable(previous[0][0], current[0][0], weight) ||
+      !gfx::scale_blendable(previous[1][1], current[1][1], weight)) {
+    return result;
+  }
   for (size_t row = 0; row < 4; ++row) {
     for (size_t column = 0; column < 4; ++column) {
       const float before = previous[row][column];

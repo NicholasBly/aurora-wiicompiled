@@ -131,3 +131,31 @@ TEST(PresentPlan, EffectivePeriodFollowsCapDisplayAndVsync) {
   EXPECT_EQ(effective_present_period(165, 0, true), period_for(165));
 }
 } // namespace
+
+#include "gfx/motion_gate.hpp"
+
+namespace {
+using aurora::gfx::rotation_blendable;
+using aurora::gfx::scale_blendable;
+
+TEST(MotionGate, MirroringNeverBlends) {
+  // Looking back can mirror the camera: blending through it squashes, predicting past it stretches.
+  EXPECT_FALSE(scale_blendable(-1.0f, 1.0f, 0.5f));
+  EXPECT_FALSE(scale_blendable(1.0f, -1.0f, 1.5f));
+  EXPECT_TRUE(scale_blendable(-1.0f, -1.0f, 1.5f));
+}
+
+TEST(MotionGate, PredictionNeedsSteadyScale) {
+  EXPECT_TRUE(scale_blendable(1.0f, 1.3f, 0.5f));    // interpolation may follow a zoom
+  EXPECT_FALSE(scale_blendable(1.0f, 1.3f, 1.5f));   // prediction would overshoot it
+  EXPECT_TRUE(scale_blendable(1.0f, 1.05f, 1.5f));
+  EXPECT_FALSE(scale_blendable(1.0f, 0.0f, 0.5f));
+}
+
+TEST(MotionGate, PredictionNeedsSmallTurns) {
+  // Quaternion dot = cos(half the turn). 10 degrees per frame predicts, 60 does not.
+  EXPECT_TRUE(rotation_blendable(0.99619f, 1.5f));
+  EXPECT_FALSE(rotation_blendable(0.86603f, 1.5f));
+  EXPECT_TRUE(rotation_blendable(0.86603f, 0.5f));
+}
+} // namespace
