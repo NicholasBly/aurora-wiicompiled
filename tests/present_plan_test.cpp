@@ -1,0 +1,119 @@
+#include "gfx/present_plan.hpp"
+
+#include <gtest/gtest.h>
+
+namespace {
+using aurora::gfx::make_present_plan;
+using aurora::gfx::MaxPresentPlanSlots;
+using aurora::gfx::PacingMode;
+using aurora::gfx::PresentPlan;
+using aurora::gfx::should_skip_present;
+using aurora::gfx::slots_needed;
+
+// The runtime's VI interval for 60 Hz video modes.
+constexpr uint64_t kInterval = 16'666'000;
+constexpr uint64_t kAnchor = 1'000'000'000;
+
+constexpr uint64_t period_for(uint32_t fps) { return 1'000'000'000ull / fps; }
+
+void expect_native_only(const PresentPlan& plan) {
+  ASSERT_EQ(plan.count, 1u);
+  EXPECT_EQ(plan.presents[0].slot, -1);
+  EXPECT_EQ(plan.presents[0].timeNanos, 0u);
+  EXPECT_FLOAT_EQ(plan.presents[0].weight, 1.0f);
+}
+
+TEST(PresentPlan, SmoothAt180SpacesTwoSlotsEvenlyAndShowsNativeLast) {
+  const auto plan = make_present_plan(PacingMode::Smooth, kAnchor, kInterval, period_for(180), 5);
+  ASSERT_EQ(plan.count, 3u);
+  EXPECT_EQ(plan.presents[0].timeNanos, kAnchor);
+  EXPECT_EQ(plan.presents[1].timeNanos, kAnchor + kInterval / 3);
+  EXPECT_EQ(plan.presents[2].timeNanos, kAnchor + kInterval * 2 / 3);
+  EXPECT_NEAR(plan.presents[0].weight, 1.0f / 3.0f, 1e-4f);
+  EXPECT_NEAR(plan.presents[1].weight, 2.0f / 3.0f, 1e-4f);
+  EXPECT_EQ(plan.presents[0].slot, 0);
+  EXPECT_EQ(plan.presents[1].slot, 1);
+  EXPECT_EQ(plan.presents[2].slot, -1);
+  EXPECT_FLOAT_EQ(plan.presents[2].weight, 1.0f);
+}
+
+TEST(PresentPlan, SmoothAt144KeepsShownTimeLinearInPresentTime) {
+  const uint64_t period = period_for(144);
+  const auto plan = make_present_plan(PacingMode::Smooth, kAnchor, kInterval, period, 5);
+  ASSERT_EQ(plan.count, 3u);
+  const float step = static_cast<float>(period) / static_cast<float>(kInterval);
+  EXPECT_EQ(plan.presents[1].timeNanos, kAnchor + period);
+  EXPECT_EQ(plan.presents[2].timeNanos, kAnchor + period * 2);
+  EXPECT_NEAR(plan.presents[0].weight, 1.0f - 2.0f * step, 1e-4f);
+  EXPECT_NEAR(plan.presents[1].weight, 1.0f - step, 1e-4f);
+  EXPECT_EQ(plan.presents[2].slot, -1);
+}
+
+TEST(PresentPlan, ResponsiveAt180ShowsNativeAtAnchorThenPredicts) {
+  const auto plan =
+      make_present_plan(PacingMode::Responsive, kAnchor, kInterval, period_for(180), 5);
+  ASSERT_EQ(plan.count, 3u);
+  EXPECT_EQ(plan.presents[0].slot, -1);
+  EXPECT_EQ(plan.presents[0].timeNanos, kAnchor);
+  EXPECT_FLOAT_EQ(plan.presents[0].weight, 1.0f);
+  EXPECT_EQ(plan.presents[1].slot, 0);
+  EXPECT_EQ(plan.presents[2].slot, 1);
+  EXPECT_NEAR(plan.presents[1].weight, 4.0f / 3.0f, 1e-4f);
+  EXPECT_NEAR(plan.presents[2].weight, 5.0f / 3.0f, 1e-4f);
+  EXPECT_EQ(plan.presents[2].timeNanos, kAnchor + kInterval * 2 / 3);
+}
+
+TEST(PresentPlan, FewerAvailableSlotsWidenThePeriod) {
+  const auto smooth = make_present_plan(PacingMode::Smooth, kAnchor, kInterval, period_for(240), 1);
+  ASSERT_EQ(smooth.count, 2u);
+  EXPECT_NEAR(smooth.presents[0].weight, 0.5f, 1e-4f);
+  EXPECT_EQ(smooth.presents[1].timeNanos, kAnchor + kInterval / 2);
+  EXPECT_EQ(smooth.presents[1].slot, -1);
+
+  const auto responsive =
+      make_present_plan(PacingMode::Responsive, kAnchor, kInterval, period_for(240), 1);
+  ASSERT_EQ(responsive.count, 2u);
+  EXPECT_NEAR(responsive.presents[1].weight, 1.5f, 1e-4f);
+}
+
+TEST(PresentPlan, NativeOnlyWhenNothingFitsBetweenFrames) {
+  expect_native_only(make_present_plan(PacingMode::Off, kAnchor, kInterval, period_for(240), 5));
+  expect_native_only(make_present_plan(PacingMode::Smooth, kAnchor, kInterval, period_for(60), 5));
+  expect_native_only(make_present_plan(PacingMode::Smooth, kAnchor, kInterval, period_for(50), 5));
+  expect_native_only(make_present_plan(PacingMode::Smooth, kAnchor, kInterval, period_for(180), 0));
+  expect_native_only(make_present_plan(PacingMode::Smooth, 0, kInterval, period_for(180), 5));
+  expect_native_only(make_present_plan(PacingMode::Responsive, kAnchor, 0, period_for(180), 5));
+}
+
+TEST(PresentPlan, SlotsNeededPerCap) {
+  EXPECT_EQ(slots_needed(PacingMode::Smooth, kInterval, period_for(120)), 1u);
+  EXPECT_EQ(slots_needed(PacingMode::Smooth, kInterval, period_for(144)), 2u);
+  EXPECT_EQ(slots_needed(PacingMode::Smooth, kInterval, period_for(165)), 2u);
+  EXPECT_EQ(slots_needed(PacingMode::Smooth, kInterval, period_for(180)), 2u);
+  EXPECT_EQ(slots_needed(PacingMode::Smooth, kInterval, period_for(200)), 3u);
+  EXPECT_EQ(slots_needed(PacingMode::Smooth, kInterval, period_for(240)), 3u);
+  EXPECT_EQ(slots_needed(PacingMode::Smooth, kInterval, period_for(360)), 5u);
+  EXPECT_EQ(slots_needed(PacingMode::Responsive, kInterval, period_for(144)), 2u);
+  EXPECT_EQ(slots_needed(PacingMode::Off, kInterval, period_for(360)), 0u);
+  EXPECT_EQ(slots_needed(PacingMode::Smooth, kInterval, period_for(1000)), MaxPresentPlanSlots);
+}
+
+TEST(PresentPlan, LateFrameSkipsOverdueSlotsButNeverTheNative) {
+  const auto plan = make_present_plan(PacingMode::Smooth, kAnchor, kInterval, period_for(240), 5);
+  ASSERT_EQ(plan.count, 4u);
+  const uint64_t muchLater = kAnchor + kInterval * 2;
+  for (uint32_t i = 0; i < plan.count; ++i) {
+    EXPECT_EQ(should_skip_present(plan, i, muchLater), plan.presents[i].slot != -1) << i;
+  }
+  // On time, nothing is skipped.
+  for (uint32_t i = 0; i < plan.count; ++i) {
+    EXPECT_FALSE(should_skip_present(plan, i, kAnchor)) << i;
+  }
+  // Responsive: the native comes first and is kept, a slot whose successor is due is dropped.
+  const auto predict =
+      make_present_plan(PacingMode::Responsive, kAnchor, kInterval, period_for(180), 5);
+  EXPECT_FALSE(should_skip_present(predict, 0, muchLater));
+  EXPECT_TRUE(should_skip_present(predict, 1, predict.presents[2].timeNanos));
+  EXPECT_FALSE(should_skip_present(predict, 2, muchLater));
+}
+} // namespace
