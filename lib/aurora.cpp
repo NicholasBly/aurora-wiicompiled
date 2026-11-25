@@ -486,6 +486,25 @@ bool begin_frame_gx() noexcept {
 
 bool begin_frame() noexcept { return begin_frame_window() && begin_frame_gx(); }
 
+std::atomic<AuroraFrameTimingCallback> g_frameTimingCallback{nullptr};
+std::atomic<void*> g_frameTimingUser{nullptr};
+std::atomic_uint64_t g_frameTag{0};
+
+void emit_frame_timing(uint64_t frameTag, AuroraFrameTimingType type, int32_t slot, bool first) noexcept {
+  const auto callback = g_frameTimingCallback.load(std::memory_order_acquire);
+  if (callback == nullptr) {
+    return;
+  }
+  const AuroraFrameTimingEvent event{
+      .frameTag = frameTag,
+      .timeNanos = gfx::presentation::now_nanos(),
+      .type = type,
+      .slot = slot,
+      .first = first,
+  };
+  callback(&event, g_frameTimingUser.load(std::memory_order_acquire));
+}
+
 void end_frame_gx(imgui::DrawData imguiDrawData) noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
@@ -526,17 +545,20 @@ void end_frame_gx(imgui::DrawData imguiDrawData) noexcept {
 #endif
 
   const auto schedule = gfx::presentation::present_schedule();
+  const uint64_t frameTag = g_frameTag.load(std::memory_order_acquire);
   const bool black = video::is_black();
   const float brightness = video::brightness();
   const bool metalfxEnabled = g_metalfxRequested.load();
   gfx::end_frame([black, brightness, metalfxEnabled, rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport, presentSource,
-                  displayCopy = std::move(displayCopy), schedule,
+                  displayCopy = std::move(displayCopy), schedule, frameTag,
                   imguiDrawData = std::move(imguiDrawData)](
                      wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks,
                      const gfx::InterpolationReplay& replay) {
     const auto presentMode = webgpu::g_graphicsConfig.surfaceConfiguration.presentMode;
     const bool blockingPresent = presentMode == wgpu::PresentMode::Fifo || presentMode == wgpu::PresentMode::FifoRelaxed;
-    const auto present = [&](wgpu::CommandEncoder& encoder, bool finalPresent, bool show) {
+    emit_frame_timing(frameTag, AURORA_FRAME_RENDER_SUBMIT_START, -1, false);
+    bool presentedAny = false;
+    const auto present = [&](wgpu::CommandEncoder& encoder, bool finalPresent, bool show, int32_t slot) {
       if (show && blockingPresent) {
         const wgpu::CommandBufferDescriptor sceneDescriptor{.label = "Scene command buffer"};
         const auto sceneCommands = encoder.Finish(&sceneDescriptor);
@@ -661,6 +683,9 @@ void end_frame_gx(imgui::DrawData imguiDrawData) noexcept {
         ZoneScopedN("Queue Submit");
         g_queue.Submit(1, &buffer);
       }
+      if (finalPresent) {
+        emit_frame_timing(frameTag, AURORA_FRAME_RENDER_SUBMIT_END, -1, false);
+      }
 
       if (g_metalfxPendingOutput) {
         if (!g_metalfxPendingOutput->end_output()) metalfx_failed(g_metalfxPendingOutput->error());
@@ -676,9 +701,12 @@ void end_frame_gx(imgui::DrawData imguiDrawData) noexcept {
           window::SurfaceLock surfaceLock;
 
           if (window::is_presentable()) {
+            emit_frame_timing(frameTag, AURORA_FRAME_PRESENT_START, slot, !presentedAny);
             const uint64_t presentStart = gfx::presentation::now_nanos();
             status = g_surface.Present();
             surfaceWaitNanos += gfx::presentation::now_nanos() - presentStart;
+            emit_frame_timing(frameTag, AURORA_FRAME_PRESENT_END, slot, !presentedAny);
+            presentedAny = true;
           }
         }
         if (blockingPresent) {
@@ -737,7 +765,7 @@ void end_frame_gx(imgui::DrawData imguiDrawData) noexcept {
       if (planned.slot < 0) {
         const uint64_t presentAt = showSlots ? planned.timeNanos : 0;
         gfx::presentation::wait_until(presentAt);
-        present(encoder, true, admit(presentAt));
+        present(encoder, true, admit(presentAt), -1);
         continue;
       }
       if (!showSlots || gfx::should_skip_present(plan, index, gfx::presentation::now_nanos()) ||
@@ -748,7 +776,7 @@ void end_frame_gx(imgui::DrawData imguiDrawData) noexcept {
       auto slotEncoder = g_device.CreateCommandEncoder(&slotDescriptor);
       replay.encode(slotEncoder, static_cast<uint32_t>(planned.slot));
       gfx::presentation::wait_until(planned.timeNanos);
-      present(slotEncoder, false, true);
+      present(slotEncoder, false, true, planned.slot);
     }
 
     for (auto& callback : afterSubmitCallbacks) {
@@ -831,6 +859,44 @@ AuroraWindowSize aurora_get_window_size() {
 }
 
 AuroraBackend aurora_get_backend() { return aurora::g_config.desiredBackend; }
+
+void aurora_set_frame_timing_callback(AuroraFrameTimingCallback callback, void* user) {
+  aurora::g_frameTimingCallback.store(nullptr, std::memory_order_release);
+  aurora::g_frameTimingUser.store(user, std::memory_order_release);
+  aurora::g_frameTimingCallback.store(callback, std::memory_order_release);
+}
+
+void aurora_set_frame_tag(uint64_t tag) { aurora::g_frameTag.store(tag, std::memory_order_release); }
+
+bool aurora_get_adapter_info(uint32_t* vendorId, uint32_t* deviceId, AuroraBackend* backend) {
+#ifdef AURORA_ENABLE_GX
+  const auto& info = aurora::webgpu::g_adapterInfo;
+  if (info.vendorID == 0 && info.deviceID == 0) {
+    return false;
+  }
+  if (vendorId != nullptr) {
+    *vendorId = info.vendorID;
+  }
+  if (deviceId != nullptr) {
+    *deviceId = info.deviceID;
+  }
+  if (backend != nullptr) {
+    switch (aurora::webgpu::g_backendType) {
+    case wgpu::BackendType::D3D11: *backend = BACKEND_D3D11; break;
+    case wgpu::BackendType::D3D12: *backend = BACKEND_D3D12; break;
+    case wgpu::BackendType::Metal: *backend = BACKEND_METAL; break;
+    case wgpu::BackendType::Vulkan: *backend = BACKEND_VULKAN; break;
+    case wgpu::BackendType::OpenGL: *backend = BACKEND_OPENGL; break;
+    case wgpu::BackendType::OpenGLES: *backend = BACKEND_OPENGLES; break;
+    case wgpu::BackendType::Null: *backend = BACKEND_NULL; break;
+    default: *backend = BACKEND_AUTO; break;
+    }
+  }
+  return true;
+#else
+  return false;
+#endif
+}
 
 const AuroraBackend* aurora_get_available_backends(size_t* count) {
   if (count != nullptr) {
