@@ -39,6 +39,10 @@ PresentPlan make_present_plan(PacingMode mode, uint64_t anchor, uint64_t interva
 // Inserted presents a frame needs for this cap, before the adaptive controller trims them.
 uint32_t slots_needed(PacingMode mode, uint64_t interval, uint64_t period) noexcept;
 
+// Present period for a frame-rate cap. `capFps` 0 matches the display; a blocking (VSync) present
+// mode cannot go faster than the display refresh. 0 when there is nothing to aim for.
+uint64_t effective_present_period(uint32_t capFps, uint64_t refreshPeriodNanos, bool vsync) noexcept;
+
 // A slot that would only show once the present after it is already due adds latency without
 // motion. The native present is never skipped.
 bool should_skip_present(const PresentPlan& plan, uint32_t index, uint64_t nowNanos) noexcept;

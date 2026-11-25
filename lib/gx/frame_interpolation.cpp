@@ -3,6 +3,7 @@
 #include "../internal.hpp"
 #include "aurora/gfx.h"
 #include "../gfx/recording.hpp"
+#include "../gfx/presentation.hpp"
 
 // Guest matrices really do carry NaN/Inf, and the isfinite guards here keep them
 // out of the MatchEdge sort. Needs -fno-finite-math-only (see runtime/CMakeLists.txt).
@@ -26,7 +27,8 @@
 
 namespace aurora::gx {
 namespace detail {
-std::atomic_uint32_t g_frameInterpolationFps{0};
+std::atomic_uint32_t g_framePacingMode{0};
+std::atomic_uint32_t g_framePacingCap{0};
 } // namespace detail
 
 thread_local int g_interpolationEncodeSlot = -1;
@@ -185,8 +187,7 @@ struct PendingUniformInterpolation {
   size_t positionOffset = 0;
   size_t normalOffset = 0;
   size_t currentMatrix = 0;
-  uint32_t numerator = 0;
-  uint32_t denominator = 1;
+  uint32_t slot = 0;
   bool indexedMatrices = false;
 };
 
@@ -257,12 +258,19 @@ uint32_t s_perspectiveMatches = 0;
 std::vector<PendingUniformInterpolation> s_pendingUniformInterpolations;
 std::atomic_bool s_hasInterpolatedFrame{false};
 std::atomic_bool s_frameInterpolationReplaySafe{true};
-uint32_t s_previousInterpolationFps = 0;
+uint32_t s_previousPacingKey = 0;
 
-// Adaptive slot count: the target moves at most one step per pacing window, while
+// Adaptive slot count, kept as a reduction below what the cap needs so that a "match display"
+// cap picks up a refresh rate learned later. It moves at most one step per pacing window, while
 // s_activeInterpolationSamples is latched per frame and must not move mid-frame.
-std::atomic_uint32_t s_interpolationSampleTarget{0};
+std::atomic_uint32_t s_interpolationSampleReduction{0};
 std::atomic_uint32_t s_activeInterpolationSamples{0};
+// Plan of the frame sealed last; written and read on the producer thread.
+gfx::PresentPlan s_sealedPresentPlan = [] {
+  gfx::PresentPlan plan;
+  plan.count = 1;
+  return plan;
+}();
 
 // Set when the producer already overran its retrace budget; the next seal then skips
 // inserted slots for that one frame, which helps the late frame catch back up.
@@ -277,11 +285,14 @@ constexpr uint32_t kPacingReducePercent = 75;
 constexpr uint32_t kPacingRestorePercent = 25;
 
 uint32_t maximum_interpolation_samples() noexcept {
-  const uint32_t targetFps = frame_interpolation_fps();
-  if (targetFps == 0) {
-    return 0;
-  }
-  return std::min(targetFps / 60 - 1, MaxInterpolatedFrames);
+  return gfx::slots_needed(frame_pacing_mode(), gfx::presentation::native_interval_nanos(),
+                           frame_pacing_period_nanos());
+}
+
+uint32_t interpolation_sample_target() noexcept {
+  const uint32_t maximum = maximum_interpolation_samples();
+  const uint32_t reduction = s_interpolationSampleReduction.load(std::memory_order_acquire);
+  return reduction >= maximum ? 0 : maximum - reduction;
 }
 
 constexpr float kMinimumScale = 1.0e-5f;
@@ -728,14 +739,14 @@ float snapshot_match_distance_squared(const FrameTransformEntry& previousEntry,
   return static_cast<float>(distance / static_cast<double>(matchedMatrices));
 }
 
-void set_frame_interpolation_fps(uint32_t targetFps) noexcept {
-  if (targetFps != 120 && targetFps != 180 && targetFps != 240) {
-    targetFps = 0;
+void set_frame_pacing(gfx::PacingMode mode, uint32_t capFps) noexcept {
+  if (mode != gfx::PacingMode::Smooth && mode != gfx::PacingMode::Responsive) {
+    mode = gfx::PacingMode::Off;
   }
-  detail::g_frameInterpolationFps.store(targetFps, std::memory_order_release);
+  detail::g_framePacingMode.store(static_cast<uint32_t>(mode), std::memory_order_release);
+  detail::g_framePacingCap.store(capFps, std::memory_order_release);
   // Start at the configured quality; the controller only ever backs off from here.
-  s_interpolationSampleTarget.store(targetFps == 0 ? 0u : std::min(targetFps / 60 - 1, MaxInterpolatedFrames),
-                                    std::memory_order_release);
+  s_interpolationSampleReduction.store(0, std::memory_order_release);
   s_dropInterpolationAtSeal.store(false, std::memory_order_release);
   s_pacingWindowFrames.store(0, std::memory_order_release);
   s_pacingWindowMisses.store(0, std::memory_order_release);
@@ -747,13 +758,22 @@ void set_frame_interpolation_fps(uint32_t targetFps) noexcept {
   s_diagLateSealDrops.store(0, std::memory_order_relaxed);
 }
 
+uint64_t frame_pacing_period_nanos() noexcept {
+  if (!frame_interpolation_active()) {
+    return 0;
+  }
+  return gfx::presentation::pacing_present_period_nanos(frame_pacing_cap());
+}
+
+const gfx::PresentPlan& sealed_present_plan() noexcept { return s_sealedPresentPlan; }
+
 void report_producer_paced(bool paced) noexcept {
   const uint32_t maximumSamples = maximum_interpolation_samples();
   if (maximumSamples == 0) {
     s_dropInterpolationAtSeal.store(false, std::memory_order_release);
     s_pacingWindowFrames.store(0, std::memory_order_release);
     s_pacingWindowMisses.store(0, std::memory_order_release);
-    s_interpolationSampleTarget.store(0, std::memory_order_release);
+    s_interpolationSampleReduction.store(0, std::memory_order_release);
     return;
   }
 
@@ -771,39 +791,36 @@ void report_producer_paced(bool paced) noexcept {
   }
   // Window complete: adjust the target one step at most, then start over. At
   // one decision per window this cannot spam the log or flap within a second.
-  uint32_t target =
-      std::min(s_interpolationSampleTarget.load(std::memory_order_acquire), maximumSamples);
+  uint32_t reduction =
+      std::min(s_interpolationSampleReduction.load(std::memory_order_acquire), maximumSamples);
   if (misses * 100u >= frames * kPacingReducePercent) {
-    if (target > 0) {
-      --target;
+    if (reduction < maximumSamples) {
+      ++reduction;
       s_diagSlotReductions.fetch_add(1, std::memory_order_relaxed);
       Log.info("interpolation slots reduced to {}: {}/{} frames overran their retrace budget",
-               target, misses, frames);
+               maximumSamples - reduction, misses, frames);
     }
   } else if (misses * 100u <= frames * kPacingRestorePercent) {
-    if (target < maximumSamples) {
-      ++target;
+    if (reduction > 0) {
+      --reduction;
       Log.info("interpolation slots restored to {}: {}/{} frames overran their retrace budget",
-               target, misses, frames);
+               maximumSamples - reduction, misses, frames);
     }
   }
-  s_interpolationSampleTarget.store(target, std::memory_order_release);
+  s_interpolationSampleReduction.store(reduction, std::memory_order_release);
   s_pacingWindowFrames.store(0, std::memory_order_release);
   s_pacingWindowMisses.store(0, std::memory_order_release);
 }
 
 void begin_frame_interpolation() noexcept {
-  const uint32_t targetFps = frame_interpolation_fps();
-  if (targetFps != s_previousInterpolationFps) {
+  const uint32_t pacingKey = (static_cast<uint32_t>(frame_pacing_mode()) << 16) | (frame_pacing_cap() & 0xFFFF);
+  if (pacingKey != s_previousPacingKey) {
     recycle_transform_entries(s_previousFrameTransforms);
-    s_previousInterpolationFps = targetFps;
+    s_previousPacingKey = pacingKey;
   }
   // Latch the slot count for the frame starting here; see s_activeInterpolationSamples
   // for why it cannot move again until the seal.
-  s_activeInterpolationSamples.store(
-      std::min(s_interpolationSampleTarget.load(std::memory_order_acquire),
-               maximum_interpolation_samples()),
-      std::memory_order_release);
+  s_activeInterpolationSamples.store(interpolation_sample_target(), std::memory_order_release);
   // Normally empty (finalize swapped and recycled); an aborted frame can leave
   // entries behind, whose matrix blocks go back to the pool here.
   recycle_transform_entries(s_currentFrameTransforms);
@@ -829,6 +846,7 @@ void begin_frame_interpolation() noexcept {
 void finalize_frame_interpolation() noexcept {
   // A frame reported late seals without inserted slots, so the encode phase renders
   // the native frame only. Its transforms still seed the next frame's matching.
+  s_sealedPresentPlan = gfx::make_present_plan(gfx::PacingMode::Off, 0, 0, 0, 0);
   if (s_dropInterpolationAtSeal.exchange(false, std::memory_order_acq_rel)) {
     s_diagLateSealDrops.fetch_add(1, std::memory_order_relaxed);
     s_hasInterpolatedFrame.store(false, std::memory_order_release);
@@ -1082,7 +1100,7 @@ void finalize_frame_interpolation() noexcept {
       [](size_t previousIndex) { return previousIndex != SIZE_MAX; }));
   // Interpolation never pauses on match quality: an unmatched draw just renders its
   // end-frame state, while a ratio gate flapped the whole output cadence instead.
-  const bool eligible = frame_interpolation_fps() != 0;
+  const bool eligible = frame_interpolation_active();
 
   // Overlay observability: the live match ratio, and how often the scene sits in
   // low-match territory where inserted slots mostly duplicate draws.
@@ -1132,6 +1150,20 @@ void finalize_frame_interpolation() noexcept {
   }
 
   if (eligible) {
+    const auto schedule = gfx::presentation::present_schedule();
+    s_sealedPresentPlan = gfx::make_present_plan(
+        frame_pacing_mode(), schedule.baseNanos, schedule.intervalNanos, frame_pacing_period_nanos(),
+        s_activeInterpolationSamples.load(std::memory_order_acquire));
+    // Weight per staged slot; slots the plan does not present are left unstaged.
+    std::array<float, MaxInterpolatedFrames> slotWeights{};
+    std::array<bool, MaxInterpolatedFrames> slotPresented{};
+    for (uint32_t i = 0; i < s_sealedPresentPlan.count; ++i) {
+      const auto& present = s_sealedPresentPlan.presents[i];
+      if (present.slot >= 0 && present.slot < static_cast<int32_t>(MaxInterpolatedFrames)) {
+        slotWeights[present.slot] = present.weight;
+        slotPresented[present.slot] = true;
+      }
+    }
     // Prepare each matched pair once: every sample of a draw shares the same
     // previous/current matrices. A flat vector keeps the sample tasks parallel.
     std::vector<PreparedTransformInterpolation> preparedTransforms(s_currentFrameTransforms.size());
@@ -1306,7 +1338,8 @@ void finalize_frame_interpolation() noexcept {
     }
 
     const auto interpolatePendingUniform = [&](const auto& task) {
-      if (task.currentTransformIndex >= s_currentFrameTransforms.size()) {
+      if (task.currentTransformIndex >= s_currentFrameTransforms.size() || task.slot >= MaxInterpolatedFrames ||
+          !slotPresented[task.slot]) {
         return;
       }
 
@@ -1323,8 +1356,7 @@ void finalize_frame_interpolation() noexcept {
         return;
       }
       const auto& previous = s_previousFrameTransforms[previousTransformIndex].transform;
-      const float weight =
-          static_cast<float>(task.numerator) / static_cast<float>(task.denominator);
+      const float weight = slotWeights[task.slot];
       const auto interpolatedProjection =
           interpolate_projection(previous.projection, current.projection, weight);
       std::memcpy(task.uniformData + task.projectionOffset, &interpolatedProjection,
@@ -1377,9 +1409,9 @@ void finalize_frame_interpolation() noexcept {
 }
 
 void get_frame_interpolation_diagnostics(AuroraFrameInterpolationDiagnostics& diagnostics) noexcept {
-  diagnostics.targetFps = frame_interpolation_fps();
-  diagnostics.targetSamples = std::min(s_interpolationSampleTarget.load(std::memory_order_acquire),
-                                       maximum_interpolation_samples());
+  const uint64_t period = frame_pacing_period_nanos();
+  diagnostics.targetFps = period == 0 ? 0 : static_cast<uint32_t>((1'000'000'000ull + period / 2) / period);
+  diagnostics.targetSamples = interpolation_sample_target();
   diagnostics.activeSamples = s_activeInterpolationSamples.load(std::memory_order_acquire);
   diagnostics.candidates = s_diagCandidates.load(std::memory_order_relaxed);
   diagnostics.matchable = s_diagMatchable.load(std::memory_order_relaxed);
@@ -1395,15 +1427,6 @@ void get_frame_interpolation_diagnostics(AuroraFrameInterpolationDiagnostics& di
 
 bool has_interpolated_frame() noexcept {
   return s_hasInterpolatedFrame.load(std::memory_order_acquire);
-}
-
-uint32_t interpolated_frame_count() noexcept {
-  if (!has_interpolated_frame()) {
-    return 0;
-  }
-  // The count latched when this frame began recording, not the configured maximum:
-  // build_uniform staged exactly this many ranges for every draw.
-  return s_activeInterpolationSamples.load(std::memory_order_acquire);
 }
 
 void drop_pending_frame_interpolation_uniforms() noexcept {
@@ -1530,8 +1553,7 @@ std::array<gfx::Range, MaxInterpolatedFrames> record_interpolation_draw(
           .positionOffset = uniformLayout.positionOffset,
           .normalOffset = uniformLayout.normalOffset,
           .currentMatrix = uniformLayout.currentMatrix,
-          .numerator = sample + 1,
-          .denominator = sampleCount + 1,
+          .slot = sample,
           .indexedMatrices = uniformLayout.indexedMatrices,
       });
       interpolatedRanges[sample] = interpolatedRange;

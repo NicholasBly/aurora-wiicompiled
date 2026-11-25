@@ -90,6 +90,14 @@ PresentPlan make_present_plan(PacingMode mode, uint64_t anchor, uint64_t interva
   return plan;
 }
 
+uint64_t effective_present_period(uint32_t capFps, uint64_t refreshPeriodNanos, bool vsync) noexcept {
+  if (capFps == 0) {
+    return refreshPeriodNanos;
+  }
+  const uint64_t capPeriod = 1'000'000'000ull / capFps;
+  return vsync ? std::max(capPeriod, refreshPeriodNanos) : capPeriod;
+}
+
 bool should_skip_present(const PresentPlan& plan, uint32_t index, uint64_t nowNanos) noexcept {
   if (index >= plan.count) {
     return true;

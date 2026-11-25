@@ -722,37 +722,34 @@ void end_frame_gx(imgui::DrawData imguiDrawData) noexcept {
       }
     };
 
-    // Interpolated slots replay the frame with blended transforms and present between frames:
-    // slot k of N+1 goes out at base + k * interval / (N + 1), the native frame last.
-    // A display no faster than the native frame rate cannot show them, so present native frames right away.
-    const uint32_t slots =
-        gfx::presentation::display_shows_interpolation(schedule.intervalNanos) ? replay.slots : 0;
-    const uint32_t groupSize = slots + 1;
-    const auto deadline = [&](uint32_t slot) -> uint64_t {
-      return slots != 0 && schedule.baseNanos != 0 && schedule.intervalNanos != 0
-                 ? schedule.baseNanos + schedule.intervalNanos * slot / groupSize
-                 : 0;
-    };
+    // Presents follow the frame's plan (gfx/present_plan.hpp): interpolated slots replay the frame
+    // with blended or extrapolated transforms, and the native frame goes out first or last by mode.
+    // A display no faster than the native frame rate cannot show slots, so the native frame then
+    // presents right away.
+    const auto& plan = replay.plan;
+    const bool showSlots = gfx::presentation::display_shows_interpolation(schedule.intervalNanos);
     const auto admit = [&](uint64_t presentAt) {
       return !blockingPresent ||
              gfx::presentation::admit_display_present(std::max(presentAt, gfx::presentation::now_nanos()));
     };
-    for (uint32_t slot = 0; slot < slots; ++slot) {
-      // A slot that would only show after the next one is due adds latency without motion.
-      if (const uint64_t next = deadline(slot + 1); next != 0 && gfx::presentation::now_nanos() >= next) {
+    for (uint32_t index = 0; index < plan.count; ++index) {
+      const auto& planned = plan.presents[index];
+      if (planned.slot < 0) {
+        const uint64_t presentAt = showSlots ? planned.timeNanos : 0;
+        gfx::presentation::wait_until(presentAt);
+        present(encoder, true, admit(presentAt));
         continue;
       }
-      if (!admit(deadline(slot))) {
+      if (!showSlots || gfx::should_skip_present(plan, index, gfx::presentation::now_nanos()) ||
+          !admit(planned.timeNanos)) {
         continue;
       }
       const wgpu::CommandEncoderDescriptor slotDescriptor{.label = "Interpolated frame encoder"};
       auto slotEncoder = g_device.CreateCommandEncoder(&slotDescriptor);
-      replay.encode(slotEncoder, slot);
-      gfx::presentation::wait_until(deadline(slot));
+      replay.encode(slotEncoder, static_cast<uint32_t>(planned.slot));
+      gfx::presentation::wait_until(planned.timeNanos);
       present(slotEncoder, false, true);
     }
-    gfx::presentation::wait_until(deadline(slots));
-    present(encoder, true, admit(deadline(slots)));
 
     for (auto& callback : afterSubmitCallbacks) {
       if (callback) {

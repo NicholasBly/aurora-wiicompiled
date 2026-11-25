@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 namespace {
+using aurora::gfx::effective_present_period;
 using aurora::gfx::make_present_plan;
 using aurora::gfx::MaxPresentPlanSlots;
 using aurora::gfx::PacingMode;
@@ -115,5 +116,18 @@ TEST(PresentPlan, LateFrameSkipsOverdueSlotsButNeverTheNative) {
   EXPECT_FALSE(should_skip_present(predict, 0, muchLater));
   EXPECT_TRUE(should_skip_present(predict, 1, predict.presents[2].timeNanos));
   EXPECT_FALSE(should_skip_present(predict, 2, muchLater));
+}
+TEST(PresentPlan, EffectivePeriodFollowsCapDisplayAndVsync) {
+  const uint64_t refresh144 = period_for(144);
+  // 0 matches the display.
+  EXPECT_EQ(effective_present_period(0, refresh144, true), refresh144);
+  EXPECT_EQ(effective_present_period(0, refresh144, false), refresh144);
+  // VSync cannot show more than the display refreshes; without it the cap stands.
+  EXPECT_EQ(effective_present_period(240, refresh144, true), refresh144);
+  EXPECT_EQ(effective_present_period(240, refresh144, false), period_for(240));
+  EXPECT_EQ(effective_present_period(120, refresh144, true), period_for(120));
+  // An unknown refresh leaves "match display" with nothing to aim for.
+  EXPECT_EQ(effective_present_period(0, 0, true), 0u);
+  EXPECT_EQ(effective_present_period(165, 0, true), period_for(165));
 }
 } // namespace
