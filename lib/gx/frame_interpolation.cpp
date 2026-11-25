@@ -434,6 +434,7 @@ struct PreparedAffinePair {
   // Linear (palette) pairs: determinants of the 3x3 parts.
   float previousDeterminant = 1.0f;
   float currentDeterminant = 1.0f;
+  float minimumAxisCosine = 1.0f;
   bool linear = false;
   bool identical = false;
   bool valid = false;
@@ -505,6 +506,20 @@ PreparedAffinePair prepare_affine_pair(const Mat3x4<float>& previous,
   return pair;
 }
 
+// Smallest cosine between matching columns (axes) of the 3x3 parts.
+float minimum_axis_cosine(const Mat3x4<float>& a, const Mat3x4<float>& b) noexcept {
+  const float ac[3][3] = {{a.m0.x(), a.m1.x(), a.m2.x()}, {a.m0.y(), a.m1.y(), a.m2.y()}, {a.m0.z(), a.m1.z(), a.m2.z()}};
+  const float bc[3][3] = {{b.m0.x(), b.m1.x(), b.m2.x()}, {b.m0.y(), b.m1.y(), b.m2.y()}, {b.m0.z(), b.m1.z(), b.m2.z()}};
+  float minimum = 1.0f;
+  for (size_t column = 0; column < 3; ++column) {
+    const float dot = ac[column][0] * bc[column][0] + ac[column][1] * bc[column][1] + ac[column][2] * bc[column][2];
+    const float lengths = std::sqrt((ac[column][0] * ac[column][0] + ac[column][1] * ac[column][1] + ac[column][2] * ac[column][2]) *
+                                    (bc[column][0] * bc[column][0] + bc[column][1] * bc[column][1] + bc[column][2] * bc[column][2]));
+    minimum = std::min(minimum, lengths > 0.0f ? dot / lengths : -1.0f);
+  }
+  return minimum;
+}
+
 float determinant3(const Mat3x4<float>& m) noexcept {
   return m.m0.x() * (m.m1.y() * m.m2.z() - m.m1.z() * m.m2.y()) -
          m.m0.y() * (m.m1.x() * m.m2.z() - m.m1.z() * m.m2.x()) +
@@ -550,6 +565,10 @@ PreparedAffinePair prepare_indexed_pair(const Mat3x4<float>& previous,
   if (!gfx::scale_blendable(pair.previousDeterminant, pair.currentDeterminant, 0.5f)) {
     return pair;
   }
+  pair.minimumAxisCosine = minimum_axis_cosine(previous, current);
+  if (!gfx::axes_blendable(pair.minimumAxisCosine, 0.5f)) {
+    return pair;
+  }
   pair.valid = true;
   return pair;
 }
@@ -560,7 +579,8 @@ bool predictable(const PreparedAffinePair& pair, float weight) noexcept {
     return true;
   }
   if (pair.linear) {
-    return gfx::scale_blendable(pair.previousDeterminant, pair.currentDeterminant, weight);
+    return gfx::scale_blendable(pair.previousDeterminant, pair.currentDeterminant, weight) &&
+           gfx::axes_blendable(pair.minimumAxisCosine, weight);
   }
   if (!gfx::rotation_blendable(pair.quaternionDot, weight)) {
     return false;

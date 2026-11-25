@@ -29,4 +29,16 @@ inline bool scale_blendable(float previous, float current, float weight) noexcep
 inline bool rotation_blendable(float quaternionDot, float weight) noexcept {
   return weight <= 1.0f || quaternionDot >= kPredictableQuaternionDot;
 }
+// Matrix palettes blend entry by entry, so a turn changes the result's size: a 180 degree turn
+// blended halfway collapses it and predicted past it stretches it. `minimumAxisCosine` is the
+// smallest cosine between matching axes (columns) of the two matrices: blending follows turns up to
+// 90 degrees, prediction up to about 23.
+constexpr float kPredictableAxisCosine = 0.92f;
+
+inline bool axes_blendable(float minimumAxisCosine, float weight) noexcept {
+  if (!std::isfinite(minimumAxisCosine) || minimumAxisCosine < 0.0f) {
+    return false;
+  }
+  return weight <= 1.0f || minimumAxisCosine >= kPredictableAxisCosine;
+}
 } // namespace aurora::gfx

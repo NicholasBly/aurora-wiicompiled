@@ -159,3 +159,16 @@ TEST(MotionGate, PredictionNeedsSmallTurns) {
   EXPECT_TRUE(rotation_blendable(0.86603f, 0.5f));
 }
 } // namespace
+
+namespace {
+using aurora::gfx::axes_blendable;
+
+TEST(MotionGate, PaletteMatricesNeedAlignedAxes) {
+  // Smallest cosine between matching matrix axes. A 180 degree turn (cos -1) never blends; blending
+  // follows up to 90 degrees, prediction only about 23.
+  EXPECT_FALSE(axes_blendable(-1.0f, 0.5f));
+  EXPECT_TRUE(axes_blendable(0.5f, 0.5f));
+  EXPECT_FALSE(axes_blendable(0.5f, 1.5f));
+  EXPECT_TRUE(axes_blendable(0.95f, 1.5f));
+}
+} // namespace
